@@ -1,12 +1,12 @@
-from chess.pgn import GameNode, ChildNode
-from chess import Move, Color
-from chess.engine import Score, Mate, Cp
+from node import Node
+from shogi import Move
+from score import Score, Mate, Cp
 from dataclasses import dataclass
 from typing import Tuple, List, Optional
 
 @dataclass
 class Puzzle:
-    node: ChildNode
+    node: Node
     moves: List[Move]
     cp: int
 
@@ -23,7 +23,7 @@ class EngineMove:
 
 @dataclass
 class NextMovePair:
-    node: GameNode
-    winner: Color
+    node: Node
+    winner: bool
     best: EngineMove
     second: Optional[EngineMove]

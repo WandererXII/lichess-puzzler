@@ -1,300 +1,278 @@
 import logging
 import argparse
-import chess
-import chess.pgn
-import chess.engine
+import shogi
 import copy
 import sys
 import util
 import bz2
 from model import Puzzle, NextMovePair
 from io import StringIO
-from chess import Move, Color
-from chess.engine import SimpleEngine, Mate, Cp, Score, PovScore
-from chess.pgn import Game, ChildNode
-from typing import List, Optional, Union
-from util import get_next_move_pair, material_count, material_diff, is_up_in_material, win_chances
+from shogi import Move, Board
+from typing import List, Optional, Union, Tuple
+from util import get_next_move_pair, material_count, material_diff, is_up_in_material, win_chances, engine_filename
 from server import Server
+#from mongo import Mongo
+from engine import YaneuraOu, Limit
+from score import Score, PovScore, Cp, Mate
+from node import Node
 
-version = 38
+version = 0
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(format='%(asctime)s %(levelname)-4s %(message)s', datefmt='%m/%d %H:%M')
+logging.basicConfig(format='%(asctime)s %(levelname)-4s %(message)s', datefmt='%m/%d %H:%M:%S')
 
-get_move_limit = chess.engine.Limit(depth = 50, time = 30, nodes = 30_000_000)
-mate_soon = Mate(15)
-allow_one_mater = False
+game_limit = Limit(depth = 15)
+pair_limit = Limit(depth = 18, time = 3)
+mate_defense_limit = Limit(depth = 15, time = 2)
 
-# is pair.best the only continuation?
-def is_valid_attack(pair: NextMovePair, engine: SimpleEngine) -> bool:
-    return (
-        pair.second is None or 
-        is_valid_mate_in_one(pair, engine) or 
-        win_chances(pair.best.score) > win_chances(pair.second.score) + 0.7
-    )
+mate_soon = Mate(10)
+allow_one_mater = True
 
-def is_valid_mate_in_one(pair: NextMovePair, engine: SimpleEngine) -> bool:
+def is_valid_mate_in_one(pair: NextMovePair, engine: YaneuraOu) -> bool:
     if pair.best.score != Mate(1):
         return False
-    non_mate_win_threshold = 0.6
+    non_mate_win_threshold = 0.85
     if not pair.second or win_chances(pair.second.score) <= non_mate_win_threshold:
-        return True
-    if pair.second.score == Mate(1):
-        # if there's more than one mate in one, gotta look if the best non-mating move is bad enough
-        logger.debug('Looking for best non-mating move...')
-        info = engine.analyse(pair.node.board(), multipv = 5, limit = get_move_limit)
-        for score in [pv["score"].pov(pair.winner) for pv in info]:
-            if score < Mate(1) and win_chances(score) > non_mate_win_threshold:
-                return False
+        logger.info("non_mate_win_threshold")
         return True
     return False
 
-def is_valid_defense(_pair: NextMovePair) -> bool:
-    return True
+# is pair.best the only continuation?
+def is_valid_attack(pair: NextMovePair, engine: YaneuraOu) -> bool:
+    return (
+        pair.second is None or 
+        is_valid_mate_in_one(pair, engine) or 
+        win_chances(pair.best.score) > win_chances(pair.second.score) + 0.4
+    )
 
-def get_next_move(engine: SimpleEngine, node: ChildNode, winner: Color) -> Optional[NextMovePair]:
-    board = node.board()
-    pair = get_next_move_pair(engine, node, winner, get_move_limit)
-    logger.debug("{} {} {}".format("attack" if board.turn == winner else "defense", pair.best, pair.second))
-    if board.turn == winner and not is_valid_attack(pair, engine):
+def get_next_pair(engine: YaneuraOu, node: Node, winner: bool) -> Optional[NextMovePair]:
+    pair = get_next_move_pair(engine, node, winner, pair_limit)
+    if node.board().turn == winner and not is_valid_attack(pair, engine):
         logger.debug("No valid attack {}".format(pair))
-        return None
-    if board.turn != winner and not is_valid_defense(pair):
-        logger.debug("No valid defense {}".format(pair))
         return None
     return pair
 
-def cook_mate(engine: SimpleEngine, node: ChildNode, winner: Color) -> Optional[List[Move]]:
+def get_next_move(engine: YaneuraOu, node: Node, limit: Limit) -> Optional[Move]:
+    result = engine.analyze(node, limit = limit)[0]["pv"][0]
+    return result if result else None
 
-    if node.board().is_game_over():
+def cook_mate(engine: YaneuraOu, node: Node, winner: bool) -> Optional[List[Move]]:
+    
+    board = node.board()
+
+    if board.is_game_over():
         return []
 
-    pair = get_next_move(engine, node, winner)
+    if board.turn == winner:
+        pair = get_next_pair(engine, node, winner)
+        if not pair:
+            return None
+        if pair.best.score < mate_soon:
+            logger.debug("Best move is not a mate, we're probably not searching deep enough")
+            return None
+        move = pair.best.move
+    else:
+        next = get_next_move(engine, node, mate_defense_limit)
+        if not next:
+            return None
+        move = next
 
+    follow_up = cook_mate(engine, node.add_variation(move), winner)
+
+    if follow_up is None:
+        return None
+
+    return [move] + follow_up
+
+
+def cook_advantage(engine: YaneuraOu, node: Node, winner: bool) -> Optional[List[NextMovePair]]:
+    
+    board = node.board()
+
+    if board.is_fourfold_repetition():
+        logger.info("Found repetition, canceling")
+        return None
+
+    pair = get_next_pair(engine, node, winner)
     if not pair:
-        return None
-
-    next = pair.best
-
-    if next.score < mate_soon:
-        logger.debug("Best move is not a mate, we're probably not searching deep enough")
-        return None
-
-    follow_up = cook_mate(engine, node.add_main_variation(next.move), winner)
-
-    if follow_up is None:
-        return None
-
-    return [next.move] + follow_up
-
-
-def cook_advantage(engine: SimpleEngine, node: ChildNode, winner: Color) -> Optional[List[NextMovePair]]:
-
-    if node.board().is_repetition(2):
-        logger.debug("Found repetition, canceling")
-        return None
-
-    next = get_next_move(engine, node, winner)
-
-    if not next:
-        logger.debug("No next move")
         return []
+    # if pair.best.score < Cp(1000):
+    #     logger.info("Not winning enough, aborting")
+    #     return None
 
-    if next.best.score.is_mate():
-        logger.debug("Expected advantage, got mate?!")
-        return None
-
-    if next.best.score < Cp(200):
-        logger.debug("Not winning enough, aborting")
-        return None
-
-    follow_up = cook_advantage(engine, node.add_main_variation(next.best.move), winner)
+    follow_up = cook_advantage(engine, node.add_variation(pair.best.move), winner)
 
     if follow_up is None:
         return None
 
-    return [next] + follow_up
+    return [pair] + follow_up
 
 
-def analyze_game(server: Server, engine: SimpleEngine, game: Game, args: argparse.Namespace) -> Optional[Puzzle]:
+def analyze_game(server: Server, engine: YaneuraOu, game: Node, args: argparse.Namespace) -> List[Puzzle]:
 
-    logger.debug("Analyzing game {}...".format(game.headers.get("Site")))
+    logger.info("Analyzing game {}...".format(game.get_id()))
+
+    node = game
+    engine.usinewgame()
+    
+    while not node.is_end():
+        node.eval = engine.analyze(node, game_limit)
+        logger.debug("%d.  %s  %s" % (node.current_board.move_number, node.move().usi() if node.move() else "    ", str(node.eval[0]["score"].sente())))
+        node = node.variation(0)
 
     prev_score: Score = Cp(20)
+    puzs: List[Puzzle] = list()
 
-    for node in game.mainline():
+    node = game
 
-        current_eval = node.eval()
+    while not node.is_end():
+
+        current_eval = node.eval[0]["score"]
 
         if not current_eval:
-            logger.debug("Skipping game without eval on ply {}".format(node.ply()))
-            return None
+            logger.debug("Skipping game without eval on move {}".format(node.current_board.move_number))
+            return puzs
 
-        result = analyze_position(server, engine, node, prev_score, current_eval, args)
+        result, puz = analyze_position(server, engine, node, prev_score, current_eval, args)
 
-        if isinstance(result, Puzzle):
-            return result
+        if isinstance(puz, Puzzle):
+            logger.info("Found puzzle in %s" % game.get_id())
+            puzs.append(puz)
 
         prev_score = -result
+        node = node.variation(0)
 
-    logger.debug("Found nothing from {}".format(game.headers.get("Site")))
+    logger.info("Found %s from %s" % (len(puzs), game.get_id()))
 
-    return None
+    return puzs
 
 
-def analyze_position(server: Server, engine: SimpleEngine, node: ChildNode, prev_score: Score, current_eval: PovScore, args: argparse.Namespace) -> Union[Puzzle, Score]:
+def analyze_position(server: Server, engine: YaneuraOu, node: Node, prev_score: Score, current_eval: PovScore, args: argparse.Namespace) -> Tuple[Score, Optional[Puzzle]]:
 
     board = node.board()
     winner = board.turn
     score = current_eval.pov(winner)
 
-    if board.legal_moves.count() < 2:
-        return score
+    logger.debug("\nAnalyzing position, scores: {} -> {}".format(prev_score, score))
 
-    if args.mates and (not score.is_mate() or score > Mate(3) or score < mate_soon):
-        return score
+    if sum(1 for i in board.legal_moves) < 2:
+        logger.debug("Not enough legal moves.")
+        return score, None
 
-    game_url = node.game().headers.get("Site")
+    logger.debug("{} {} to {}".format(node.current_board.move_number, node.move() if node.move() else None, score))
 
-    logger.debug("{} {} to {}".format(node.ply(), node.move.uci() if node.move else None, score))
-
-    if prev_score > Cp(300) and score < mate_soon:
-        logger.debug("{} Too much of a winning position to start with {} -> {}".format(node.ply(), prev_score, score))
-        return score
-    if is_up_in_material(board, winner):
-        logger.debug("{} already up in material {} {} {}".format(node.ply(), winner, material_count(board, winner), material_count(board, not winner)))
-        return score
+    if prev_score > Cp(3000) and score < mate_soon:
+        logger.debug("{} Too much of a winning position to start with {} -> {}".format(node.current_board.move_number, prev_score, score))
+        return score, None
+    if is_up_in_material(board, winner) and prev_score > Cp(2200):
+        logger.debug("{} already up in material {} {} {}".format(node.current_board.move_number, winner, material_count(board, winner), material_count(board, not winner)))
+        return score, None
     elif score >= Mate(1) and not allow_one_mater:
-        logger.debug("{} mate in one".format(node.ply()))
-        return score
+        logger.debug("{} mate in one".format(node.current_board.move_number))
+        return score, None
     elif score > mate_soon:
-        logger.debug("Mate {}#{} Probing...".format(game_url, node.ply()))
+        logger.debug("Mate {}. {} Probing...".format(node.current_board.move_number, score))
         if server.is_seen_pos(node):
             logger.debug("Skip duplicate position")
-            return score
+            return score, None
         mate_solution = cook_mate(engine, copy.deepcopy(node), winner)
-        if not args.mates:
-            server.set_seen(node.game())
-        return Puzzle(node, mate_solution, 999999999) if mate_solution is not None else score
-    elif score >= Cp(200) and win_chances(score) > win_chances(prev_score) + 0.6:
-        if score < Cp(400) and material_diff(board, winner) > -1:
-            logger.debug("Not clearly winning and not from being down in material, aborting")
-            return score
-        logger.debug("Advantage {}#{} {} -> {}. Probing...".format(game_url, node.ply(), prev_score, score))
+        server.set_seen(node)
+        return score, Puzzle(node, mate_solution, 999999999) if mate_solution is not None else None
+    elif win_chances(score) > win_chances(prev_score) + 0.40:
+        if score < Cp(750) and win_chances(score) < win_chances(prev_score) + 0.50:
+            logger.debug("Not clearly winning and not equalizing enough, aborting")
+            return score, None
+        logger.debug("Advantage {}. {} -> {}. Probing...".format(node.current_board.move_number, prev_score, score))
         if server.is_seen_pos(node):
             logger.debug("Skip duplicate position")
-            return score
+            return score, None
         puzzle_node = copy.deepcopy(node)
         solution : Optional[List[NextMovePair]] = cook_advantage(engine, puzzle_node, winner)
-        server.set_seen(node.game())
+        server.set_seen(node)
         if not solution:
-            return score
+            return score, None
         while len(solution) % 2 == 0 or not solution[-1].second:
             if not solution[-1].second:
                 logger.debug("Remove final only-move")
             solution = solution[:-1]
         if not solution or len(solution) == 1:
             logger.debug("Discard one-mover")
-            return score
+            return score, None
         cp = solution[len(solution) - 1].best.score.score()
-        return Puzzle(node, [p.best.move for p in solution], 999999998 if cp is None else cp)
+        return score, Puzzle(node, [p.best.move for p in solution], 999999998 if cp is None else cp)
     else:
-        return score
+        logger.debug("Nothing, {}, {}".format(score, win_chances(score)))
+        return score, None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog='generator.py',
-        description='takes a pgn file and produces chess puzzles')
-    parser.add_argument("--file", "-f", help="input PGN file", required=True, metavar="FILE.pgn")
-    parser.add_argument("--engine", "-e", help="analysis engine", default="./stockfish")
+        description='takes a file and produces shogi puzzles')
+    parser.add_argument("--file", "-f", help="input file", required=True, metavar="FILE.txt")
+    parser.add_argument("--engine", "-e", help="analysis engine", default="YaneuraOu.exe")
     parser.add_argument("--threads", "-t", help="count of cpu threads for engine searches", default="4")
-    parser.add_argument("--url", "-u", help="URL where to post puzzles", default="http://localhost:8000")
-    parser.add_argument("--token", help="Server secret token", default="changeme")
+    parser.add_argument("--uri", "-u", help="mongo URI where to post puzzles", default="mongodb://localhost:27017/")
     parser.add_argument("--skip", help="How many games to skip from the source", default="0")
-    parser.add_argument('--master', help="Only master blitz games", dest='master', default=False, action='store_true')
-    parser.add_argument('--mates', help="Only mates in 3+, looking in blitz games", dest='mates', default=False, action='store_true')
-    parser.add_argument('--bullet', help="Only master bullet games (for supergms)", dest='bullet', default=False, action='store_true')
     parser.add_argument("--verbose", "-v", help="increase verbosity", action="count")
 
     return parser.parse_args()
 
+# expects this format: id;sfen;moves separated by space
+def read_game(l: str) -> Optional[Node]:
+    
+    splitted = l.split(';')
+    if splitted[1]:
+        sfen = splitted[1]
+    else:
+        sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
+    moves = splitted[2].split(' ')
+    root = Node(Board(sfen))
+    root.id = splitted[0]
+    node = root
+    for m in moves:
+        if node.current_board.move_number > 80 or not m:
+            break
+        node = node.add_variation(Move.from_usi(m))
+    return root
 
-def make_engine(executable: str, threads: int) -> SimpleEngine:
-    engine = SimpleEngine.popen_uci(executable)
-    engine.configure({'Threads': threads})
-    return engine
-
-
-def open_file(file: str):
-    if file.endswith(".bz2"):
-        return bz2.open(file, "rt")
-    return open(file)
 
 def main() -> None:
     sys.setrecursionlimit(10000) # else node.deepcopy() sometimes fails?
     args = parse_args()
-    args.master = args.master or args.bullet
-    if args.verbose == 2:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
-    engine = make_engine(args.engine, args.threads)
-    server = Server(logger, args.url, args.token, version)
+    logger.setLevel(logging.INFO)
+    engine = YaneuraOu(args.engine)
+    engine.start_engine(args.threads)
+    server = Server(logger, args.uri, version)
     games = 0
-    site = "?"
-    has_master = False
     skip = int(args.skip)
     logger.info("Skipping first {} games".format(skip))
 
     print(f'v{version} {args.file}')
 
     try:
-        with open_file(args.file) as pgn:
+        with open(args.file) as m_file:
             skip_next = False
-            for line in pgn:
-                if line.startswith("[Site "):
-                    site = line
-                    games = games + 1
-                    has_master = False
-                elif games < skip:
+            for line in m_file:
+                if games < skip:
                     continue
-                elif (
-                        (line.startswith("[WhiteTitle ") or line.startswith("[BlackTitle ")) and
-                        "BOT" not in line
-                    ):
-                    has_master = True
-                elif util.reject_by_time_control(line, has_master = has_master, master_only = args.master, bullet = args.bullet, mates = args.mates):
-                    skip_next = True
-                elif util.exclude_rating(line, args.mates):
-                    skip_next = True
-                elif line.startswith("[Variant ") and not line.startswith("[Variant \"Standard\"]"):
-                    skip_next = True
-                elif line.startswith("1. ") and (skip_next or (args.master and not has_master)):
-                    logger.debug("Skip {}".format(site))
-                    skip_next = False
-                elif "%eval" in line:
-                    game = chess.pgn.read_game(StringIO("{}\n{}".format(site, line)))
-                    assert(game)
-                    game_id = game.headers.get("Site", "?")[20:]
-                    if not args.mates and server.is_seen(game_id):
-                        to_skip = (0 if args.bullet or args.master or args.mates else 5000)
+                if (game := read_game(line.strip('\n'))):
+                    game_id = game.get_id()
+                    logger.info(game_id)
+                    if server.is_seen(game_id):
+                        to_skip = 100
                         logger.info(f'Game was already seen before, skipping {to_skip} - {games}')
                         skip = games + to_skip
                         continue
-
-                    try:
-                        puzzle = analyze_game(server, engine, game, args)
-                        if puzzle is not None:
-                            logger.info(f'v{version} {args.file} {util.avg_knps()} knps, Game {games}')
-                            server.post(game_id, puzzle)
-                    except Exception as e:
-                        logger.error("Exception on {}: {}".format(game_id, e))
+                    puzzles = analyze_game(server, engine, game, args)
+                    if puzzles:
+                        logger.debug(f'v{version} {args.file} {util.avg_knps()} knps, Game {games}')
+                        server.post(game_id, puzzles)
     except KeyboardInterrupt:
         print(f'v{version} {args.file} Game {games}')
         sys.exit(1)
 
-    engine.close()
+    engine.quit()
 
 if __name__ == "__main__":
     main()

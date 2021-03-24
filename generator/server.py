@@ -1,79 +1,40 @@
 import logging
-from chess.pgn import Game, GameNode, ChildNode
+import pymongo
+
+from node import Node
 from model import Puzzle
-import requests
-import urllib.parse
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
-
-retry_strategy = Retry(
-    total=999999999,
-    backoff_factor=0.1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    method_whitelist=["GET", "POST"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-http = requests.Session()
-http.mount("https://", adapter)
-http.mount("http://", adapter)
-
-TIMEOUT = 5
+from typing import List
 
 class Server:
 
-    def __init__(self, logger: logging.Logger, url: str, token: str, version: int) -> None:
-        self.logger = logger
-        self.url = url
-        self.token = token
+    def __init__(self, logger: logging.Logger, uri: str, version: int) -> None:
+        self.myclient = pymongo.MongoClient(uri)
+        self.mydb = self.myclient["genpuzzles"]
+        self.col = self.mydb["puz"]
+        self.poscol = self.mydb["puzpos"]
         self.version = version
 
-    def is_seen(self, id: str) -> bool:
-        if not self.url:
-            return False
-        try:
-            status = http.get(self._seen_url(id), timeout = TIMEOUT).status_code
-            return status == 200
-        except Exception as e:
-            self.logger.error(e)
-            return False
+    def is_seen(self, game_id: str) -> bool:
+        return self.col.count_documents({"game_id": game_id}, limit = 1) > 0
 
-    def set_seen(self, game: Game) -> None:
-        try:
-            if self.url:
-                http.post(self._seen_url(game.headers.get("Site", "?")[20:]), timeout = TIMEOUT)
-        except Exception as e:
-            self.logger.error(e)
+    def set_seen(self, node: Node) -> None:
+        self.poscol.insert_one({"_id": node.current_board.sfen()})
 
-    def is_seen_pos(self, node: ChildNode) -> bool:
-        if not self.url:
-            return False
-        id = urllib.parse.quote(f"{node.parent.board().fen()}:{node.uci()}")
-        try:
-            status = http.get(self._seen_url(id), timeout = TIMEOUT).status_code
-            return status == 200
-        except Exception as e:
-            self.logger.error(e)
-            return False
+    def is_seen_pos(self, node: Node) -> bool:
+        return self.poscol.count_documents({"_id": node.current_board.sfen()}, limit = 1) > 0
 
-    def _seen_url(self, id: str) -> str:
-        return "{}/seen?token={}&id={}".format(self.url, self.token, id)
-
-    def post(self, game_id: str, puzzle: Puzzle) -> None:
-        parent = puzzle.node.parent
-        assert parent
-        json = {
-            'game_id': game_id,
-            'fen': parent.board().fen(),
-            'ply': parent.ply(),
-            'moves': [puzzle.node.uci()] + list(map(lambda m : m.uci(), puzzle.moves)),
-            'cp': puzzle.cp,
-            'generator_version': self.version,
-        }
-        if not self.url:
-            print(json)
-            return None
-        try:
-            r = http.post("{}/puzzle?token={}".format(self.url, self.token), json=json)
-            self.logger.info(r.text if r.ok else "FAILURE {}".format(r.text))
-        except Exception as e:
-            self.logger.error("Couldn't post puzzle: {}".format(e))
+    def post(self, game_id: str, puzzles: List[Puzzle]) -> None:
+        for puzzle in puzzles:
+            parent = puzzle.node.parent
+            assert parent
+            json = {
+                'game_id': game_id,
+                'fen': parent.current_board.sfen(),
+                'ply': parent.current_board.move_number - 1,
+                'moves': [puzzle.node.move().usi()] + list(map(lambda m : m.usi(), puzzle.moves)),
+                'cp': puzzle.cp,
+                'generator_version': self.version,
+            }
+            self.col.insert_one(json)
+            print(json, flush=True)
+        return None
