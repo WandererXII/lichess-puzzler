@@ -146,7 +146,7 @@ class YaneuraOu:
     def id(self) -> str:
         return str(self.engine_proccess.pid)
 
-    def start_engine(self, threads=4, memory=512):
+    def start_engine(self, threads=2, memory=512):
         self.usi()
         self.setoption("Threads", str(threads))
         self.setoption("USI_Hash", str(memory))

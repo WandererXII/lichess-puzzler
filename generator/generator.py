@@ -11,7 +11,6 @@ from shogi import Move, Board
 from typing import List, Optional, Union, Tuple
 from util import get_next_move_pair, material_count, material_diff, is_up_in_material, win_chances, engine_filename
 from server import Server
-#from mongo import Mongo
 from engine import YaneuraOu, Limit
 from score import Score, PovScore, Cp, Mate
 from node import Node
@@ -21,9 +20,9 @@ version = 0
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s %(levelname)-4s %(message)s', datefmt='%m/%d %H:%M:%S')
 
-game_limit = Limit(depth = 15)
-pair_limit = Limit(depth = 18, time = 3)
-mate_defense_limit = Limit(depth = 15, time = 2)
+game_limit = Limit(depth = 15, time = 3)
+pair_limit = Limit(depth = 18, time = 5)
+mate_defense_limit = Limit(depth = 15)
 
 mate_soon = Mate(10)
 allow_one_mater = True
@@ -33,7 +32,6 @@ def is_valid_mate_in_one(pair: NextMovePair, engine: YaneuraOu) -> bool:
         return False
     non_mate_win_threshold = 0.85
     if not pair.second or win_chances(pair.second.score) <= non_mate_win_threshold:
-        logger.info("non_mate_win_threshold")
         return True
     return False
 
@@ -90,7 +88,6 @@ def cook_advantage(engine: YaneuraOu, node: Node, winner: bool) -> Optional[List
     board = node.board()
 
     if board.is_fourfold_repetition():
-        logger.info("Found repetition, canceling")
         return None
 
     pair = get_next_pair(engine, node, winner)
@@ -142,7 +139,8 @@ def analyze_game(server: Server, engine: YaneuraOu, game: Node, args: argparse.N
         prev_score = -result
         node = node.variation(0)
 
-    logger.info("Found %s from %s" % (len(puzs), game.get_id()))
+    if len(puzs) > 0:
+        logger.info("Found %s from %s" % (len(puzs), game.get_id()))
 
     return puzs
 
@@ -210,8 +208,7 @@ def parse_args() -> argparse.Namespace:
         prog='generator.py',
         description='takes a file and produces shogi puzzles')
     parser.add_argument("--file", "-f", help="input file", required=True, metavar="FILE.txt")
-    parser.add_argument("--engine", "-e", help="analysis engine", default="YaneuraOu.exe")
-    parser.add_argument("--threads", "-t", help="count of cpu threads for engine searches", default="4")
+    parser.add_argument("--threads", "-t", help="count of cpu threads for engine searches", default="2")
     parser.add_argument("--uri", "-u", help="mongo URI where to post puzzles", default="mongodb://localhost:27017/")
     parser.add_argument("--skip", help="How many games to skip from the source", default="0")
     parser.add_argument("--verbose", "-v", help="increase verbosity", action="count")
@@ -231,7 +228,7 @@ def read_game(l: str) -> Optional[Node]:
     root.id = splitted[0]
     node = root
     for m in moves:
-        if node.current_board.move_number > 80 or not m:
+        if node.current_board.move_number > 85 or not m:
             break
         node = node.add_variation(Move.from_usi(m))
     return root
@@ -241,7 +238,7 @@ def main() -> None:
     sys.setrecursionlimit(10000) # else node.deepcopy() sometimes fails?
     args = parse_args()
     logger.setLevel(logging.INFO)
-    engine = YaneuraOu(args.engine)
+    engine = YaneuraOu(engine_filename())
     engine.start_engine(args.threads)
     server = Server(logger, args.uri, version)
     games = 0
@@ -258,16 +255,18 @@ def main() -> None:
                     continue
                 if (game := read_game(line.strip('\n'))):
                     game_id = game.get_id()
-                    logger.info(game_id)
                     if server.is_seen(game_id):
-                        to_skip = 100
+                        to_skip = 50
                         logger.info(f'Game was already seen before, skipping {to_skip} - {games}')
                         skip = games + to_skip
                         continue
-                    puzzles = analyze_game(server, engine, game, args)
-                    if puzzles:
-                        logger.debug(f'v{version} {args.file} {util.avg_knps()} knps, Game {games}')
-                        server.post(game_id, puzzles)
+                    try:
+                        puzzles = analyze_game(server, engine, game, args)
+                        if puzzles:
+                            logger.debug(f'v{version} {args.file} {util.avg_knps()} knps, Game {games}')
+                            server.post(game_id, puzzles)
+                    except Exception as e:
+                        logger.error("Exception on {}: {}".format(game_id, e))
     except KeyboardInterrupt:
         print(f'v{version} {args.file} Game {games}')
         sys.exit(1)

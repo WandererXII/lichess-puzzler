@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import math
 import shogi
+import os
 from model import EngineMove, NextMovePair
 from shogi import Board
 from node import Node
